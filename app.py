@@ -136,7 +136,7 @@ def bar(ax, labels, values, colors, title, ylim=(0, 1), fmt="{:.0%}"):
 st.sidebar.title("JJUSHYCSH referral no-show risk")
 st.sidebar.caption(f"BAN6800 capstone · {AUTHOR} · Nexford University")
 page = st.sidebar.radio("Go to", ["Overview", "Model results", "What drives predictions", "What-if: score an appointment",
-                                  "Ethical compliance (fairness)", "Limitations & transparency", "About the data"])
+                                  "Ethical compliance (fairness)", "Monitoring (drift & fairness)", "Limitations & transparency", "About the data"])
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"**Champion model:** {CH_NAME}  \n**High-risk threshold:** {T_HIGH:.2f}  \n"
                     f"**Run date:** {R['run_date']}  \n**Data:** Module 3 test split, {R['n_test']:,} appointments")
@@ -356,7 +356,7 @@ patients in every group are *found* at the same rate. The release threshold is a
 in recall (true-positive rate) between the best- and worst-served group. The flag-rate ratio (four-fifths rule, ≥ {DI_MIN})
 and the false-positive-rate gap are shown as diagnostics. Groups are the four the Module 3 bias suite monitors.
 """)
-    t = st.slider("Decision threshold (the operating point is marked)", 0.05, 0.95, float(round(T_HIGH, 2)), 0.01)
+    t = st.slider("Decision threshold (the operating point is marked)", 0.05, 0.95, float(round(T_HIGH, 3)), 0.001, format="%.3f")
     overall = metrics_at(S["no_show"].values, S["p_no_show"].values, t)
     c1, c2, c3 = st.columns(3)
     c1.metric("Recall at this threshold", pct(overall["recall"], 1)); c2.metric("Precision", pct(overall["precision"], 1))
@@ -374,7 +374,8 @@ and the false-positive-rate gap are shown as diagnostics. Groups are the four th
         fig, axes = plt.subplots(1, 4, figsize=(13, 3.2))
         for ax, attr in zip(axes, tabs):
             tab = tabs[attr]
-            ax.bar(tab["group"].astype(str), tab["recall"], color=TEAL)
+            _lbl = {"F": "Women", "M": "Men", "0": "No", "1": "Yes"}
+            ax.bar(tab["group"].astype(str).map(lambda g: _lbl.get(g, g)), tab["recall"], color=TEAL)
             ax.axhline(TARGET_RECALL, color=RED, ls=":", lw=1)
             ax.set_ylim(0, 1); ax.set_title(f"Recall by {GROUP_LABEL[attr].lower()}", fontsize=10)
             ax.tick_params(axis="x", labelsize=8, rotation=30); ax.spines[["top", "right"]].set_visible(False)
@@ -402,6 +403,53 @@ and the false-positive-rate gap are shown as diagnostics. Groups are the four th
         st.markdown(f"- **No mitigation was needed**: {mit.get('reason', '')}. The routine stays in the pipeline and runs at every retraining.")
     st.markdown("- The disability group is only ~2 % of records (flagged in Module 3), so its estimates are less precise "
                 "and are watched separately.")
+
+# ============================================================================ Monitoring (Final Project)
+elif page == "Monitoring (drift & fairness)":
+    import json as _json
+    st.title("Monitoring: data drift, prediction drift and fairness drift")
+    st.markdown("Reads `monitoring/outputs/monitoring_summary.json`, written by `monitoring/monitor.py` (run monthly by the "
+                "`retrain` GitHub Actions workflow or the `monitoring` service in docker-compose). Thresholds come from the "
+                "Module 4 model card and the Module 2 fairness release criteria.")
+    mon_paths = [HERE.parent / "monitoring" / "outputs" / "monitoring_summary.json", DATA / "monitoring_summary.json"]
+    mon = next((p for p in mon_paths if p.exists()), None)
+    if mon is None:
+        st.warning("No monitoring summary found. Run `python monitoring/monitor.py --demo` from the repository root.")
+    else:
+        M = _json.loads(mon.read_text())
+        batches = {"Latest batch": M.get("latest", M), "Stress test (simulated +3-day lead-time shift)": M.get("stress_test")}
+        batches = {k: v for k, v in batches.items() if v}
+        choice = st.radio("Batch", list(batches), horizontal=True)
+        S = batches[choice]
+        colour = {"OK": "green", "WARN": "orange", "ALERT": "red"}[S["status"]]
+        st.markdown(f"### Status: :{colour}[{S['status']}]  \n*{S['batch']}* · generated {S['generated_at']} · "
+                    f"reference n = {S['n_reference']:,}, current n = {S['n_current']:,}")
+        st.info(S["action"])
+        if S["alerts"]:
+            st.error("**Alerts**\n\n" + "\n".join(f"- {a}" for a in S["alerts"]))
+        if S["warnings"]:
+            st.warning("**Warnings**\n\n" + "\n".join(f"- {a}" for a in S["warnings"]))
+        c1, c2, c3 = st.columns(3)
+        pdft = S["prediction_drift"]; pc = S.get("performance_current") or {}; pr = S.get("performance_reference") or {}
+        c1.metric("Prediction PSI", f"{pdft['psi']:.3f}", "alert ≥ 0.20")
+        c2.metric("Flag rate", pct(pdft["cur_flag_rate"]), f"reference {pct(pdft['ref_flag_rate'])}")
+        if pc:
+            c3.metric("Recall (current)", pct(pc["recall"]), f"reference {pct(pr.get('recall', 0))}; floor 65%")
+        st.markdown("#### Feature drift (population stability index)")
+        fd = pd.DataFrame(S["feature_drift"])
+        st.dataframe(fd, use_container_width=True, hide_index=True)
+        st.markdown("#### Fairness on the current batch (deployed age-band thresholds)")
+        rows = []
+        for attr, f in S["fairness_current"].items():
+            rows.append({"attribute": attr, "TPR gap": f.get("tpr_gap"), "FPR gap": f.get("fpr_gap"),
+                         "DP difference": f.get("dp_difference"), "DI ratio": f.get("di_ratio"),
+                         "release rule (TPR gap ≤ 0.10)": "pass" if (f.get("tpr_gap") or 0) <= 0.10 else "FAIL"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        with st.expander("Per-group detail"):
+            for attr, f in S["fairness_current"].items():
+                st.markdown(f"**{attr}**"); st.dataframe(pd.DataFrame(f["groups"]), hide_index=True)
+        st.caption("Limits: PSI warn 0.10 / alert 0.20; recall floor 0.65; TPR gap ≤ 0.10 (release rule); DI ratio ≥ 0.80 "
+                   "(diagnostic). An ALERT opens the incident process in docs/incident_response.md.")
 
 # ============================================================================ Limitations
 elif page == "Limitations & transparency":
